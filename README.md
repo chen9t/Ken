@@ -1,4 +1,4 @@
 Ken
 ===
 
-Tiny operating system based on OSASK by H.Kawai:http://www.imasy.org/~kawai/
+Tiny operating system based on OSASK by H.Kawai,http://osask.net/

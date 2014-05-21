@@ -1,217 +1,337 @@
-#include<stdio.h>
-void io_hlt(void);
-void io_cli(void);
-void io_out8(int port,int data);
-int io_load_eflags(void);
-void io_store_eflags(int eflags);
+#include "bootpack.h"
+#include <stdio.h>
 
-void init_palette(void);
-void set_palette(int start,int end,unsigned char *rgb);
-void boxfill8(unsigned char *vram, int xsize, unsigned char c, int x0, int y0, int x1, int y1);
-void init_screen(char *vram, int x, int y);
-void putfont8(char *vram,int xsize,int x,int y,char c,char *font);
-void putfonts8_asc(char *vram,int xsize,int x,int y,char c,unsigned char *s);
-void init_mouse_cursor8(char *mouse,char bc);
-void putblock8_8(char *vram,int vxsize,int pxsize,int pysize,int px0,int py0,char *buf,int bxsize);
+void make_window8(unsigned char *buf, int xsize, int ysize, char *title,char act);
+void putfonts8_asc_sht(struct SHEET *sht,int x,int y,int c,int b,char *s,int l);
+void make_textbox8(struct SHEET *sht, int x0, int y0, int sx, int sy, int c);
 
-#define COL8_000000		0
-#define COL8_FF0000		1
-#define COL8_00FF00		2
-#define COL8_FFFF00		3
-#define COL8_0000FF		4
-#define COL8_FF00FF		5
-#define COL8_00FFFF		6
-#define COL8_FFFFFF		7
-#define COL8_C6C6C6		8
-#define COL8_840000		9
-#define COL8_008400		10
-#define COL8_848400		11
-#define COL8_000084		12
-#define COL8_840084		13
-#define COL8_008484		14
-#define COL8_848484		15
-
-/*该结构体与P58的BOOT_INFO数据结构相对应*/
-struct BOOTINFO{	
-	char cyls,leds,vomde,reserve;
-	short scrnx,scrny;
-	char *vram;
-};
+void task_b_main(struct SHEET *sht_back);
 
 void HariMain(void)
 {
-	struct BOOTINFO *binfo=(struct BOOTINFO *)0x0ff0;	/*将0x0ff0内存附近的启动信息提取出来*/
-	char s[40],mcursor[256];
-	int mx,my;
+	struct BOOTINFO *binfo=(struct BOOTINFO *)ADR_BOOTINFO;	/*将0x0ff0内存附近的启动信息提取出来*/
+	struct FIFO32 fifo; 
+	char s[40];
+	int fifobuf[128];
+	int mx,my,i,cursor_x,cursor_c;
+	unsigned int memtotal;
+	struct MOUSE_DEC mdec;
+	struct MEMMAN *memman = (struct MEMMAN *) MEMMAN_ADDR;
+	struct SHTCTL *shtctl;
+	static char keytable[0x54] = {
+		0,   0,   '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '^', 0,   0,
+		'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '@', '[', 0,   0,   'A', 'S',
+		'D', 'F', 'G', 'H', 'J', 'K', 'L', ';', ':', 0,   0,   ']', 'Z', 'X', 'C', 'V',
+		'B', 'N', 'M', ',', '.', '/', 0,   '*', 0,   ' ', 0,   0,   0,   0,   0,   0,
+		0,   0,   0,   0,   0,   0,   0,   '7', '8', '9', '-', '4', '5', '6', '+', '1',
+		'2', '3', '0', '.'
+	};
+	struct SHEET *sht_back,*sht_mouse,*sht_win,*sht_win_b[3];
+	unsigned char *buf_back,buf_mouse[256],*buf_win,*buf_win_b;
+	struct TASK *task_a,*task_b[3];	
+	struct TIMER *timer;
+	
+	init_gdtidt();	/*初始化GDT和IDT*/
+	init_pic();		/*初始化PIC*/
+	io_sti();		/*在init_pic中，中断都被屏蔽，打开所有中断*/
+	fifo32_init(&fifo,128,fifobuf,0);	/*初始化FIFO内存缓冲区*/
+	init_pit();	/*初始化pit*/
+	init_keyboard(&fifo,256);	/*对接缓冲区，设置标识键盘中断所要增加的数字,使其可以发送鼠标中断*/
+	enable_mouse(&fifo,512,&mdec);	/*激活鼠标，对接缓冲区，设置标识鼠标中断所要增加的数字*/
+	io_out8(PIC0_IMR,0xf8);	/*11111000，屏蔽掉PIC0上除IRQ1和IRQ2中断线上的中断（即键盘中断和与PIC2的中断）*/
+	io_out8(PIC1_IMR,0xef);	/*11101111，屏蔽掉PIC1上除IRQ4中断线上的中断（即鼠标中断）*/
+	
+	/*初始化内存*/
+	memtotal = memtest(0x00400000, 0xbfffffff);
+	memman_init(memman);
+	memman_free(memman, 0x00001000, 0x0009e000); /* 0x00001000 - 0x0009efff */
+	memman_free(memman, 0x00400000, memtotal - 0x00400000);
 	
 	init_palette();	/*设定调色板*/
-	init_screen(binfo->vram,binfo->scrnx,binfo->scrny);	/*显示画面背景*/
+	shtctl=shtctl_init(memman,binfo->vram,binfo->scrnx,binfo->scrny);
+
+	/*设置光标用定时器*/
+	timer=timer_alloc();
+	timer_init(timer,&fifo,1);
+	timer_settime(timer,50);
+
+	/*初始化任务*/
+	task_a=task_init(memman);
+	fifo.task=task_a;
+	task_run(task_a, 1, 2);
+
+	/*sht_back*/
+	sht_back=sheet_alloc(shtctl);
+	buf_back=(unsigned char *)memman_alloc_4k(memman,binfo->scrnx * binfo->scrny);
+	sheet_setbuf(sht_back,buf_back,binfo->scrnx,binfo->scrny,-1);	/*没有透明色号*/
+	init_screen8(buf_back,binfo->scrnx,binfo->scrny);	/*显示画面背景*/
+
+	/*sht_win_b*/
+	for(i=0;i<3;i++){
+
+		sht_win_b[i]=sheet_alloc(shtctl);
+		buf_win_b=(unsigned char *)memman_alloc_4k(memman,144 * 52);
+		sheet_setbuf(sht_win_b[i],buf_win_b,144,52,-1);
+
+		sprintf(s,"task_b%d",i);
+		make_window8(buf_win_b,144,52,s,0);
+
+		/*任务b的初始化*/
+		task_b[i]=task_alloc();
+		task_b[i]->tss.esp = memman_alloc_4k(memman, 64 * 1024) + 64 * 1024 - 8;
+		task_b[i]->tss.eip = (int) &task_b_main;
+		task_b[i]->tss.eflags = 0x00000202; /* IF = 1; */
+		task_b[i]->tss.es = 1 * 8;
+		task_b[i]->tss.cs = 2 * 8;
+		task_b[i]->tss.ss = 1 * 8;
+		task_b[i]->tss.ds = 1 * 8;
+		task_b[i]->tss.fs = 1 * 8;
+		task_b[i]->tss.gs = 1 * 8;
+
+		*((int *) (task_b[i]->tss.esp+4))=(int) sht_win_b[i]; /*将sht_win_b的地址存在[ESP+4]中，以便函数进行调用*/
+		task_run(task_b[i],2,i+1);
+
+	}
+
+	/*sht_win*/
+	sht_win=sheet_alloc(shtctl);
+	buf_win=(unsigned char*)memman_alloc_4k(memman,160*52);
+	sheet_setbuf(sht_win,buf_win,144,52,-1);	/*没有透明色号*/
+
+	make_window8(buf_win,144,52,"task_a",1);	/*描画窗口界面*/
+	make_textbox8(sht_win,8,28,128,16,COL8_FFFFFF);	/*描绘编辑窗口界面*/
+
+	cursor_x = 8;
+	cursor_c = COL8_FFFFFF;
+
+	/*sht_mouse*/
+	sht_mouse=sheet_alloc(shtctl);
+	sheet_setbuf(sht_mouse,buf_mouse,16,16,99);	/*透明色号99*/
+	init_mouse_cursor8(buf_mouse,99);	/*描画鼠标指针,背景色号99*/
 	
+	/*设定鼠标的初始位置为屏幕中间*/
 	mx = (binfo->scrnx - 16) / 2;
 	my = (binfo->scrny - 28 - 16) / 2;
+
+	/*对图层的位置初始化*/
+	sheet_slide(sht_back,0,0);
+	sheet_slide(sht_win_b[0], 168,  56);
+	sheet_slide(sht_win_b[1],   8, 116);
+	sheet_slide(sht_win_b[2], 168, 116);
+	sheet_slide(sht_win,        8,  56);
+	sheet_slide(sht_mouse,mx,my);
+	sheet_updown(sht_back,     0);
+	sheet_updown(sht_win_b[0], 1);
+	sheet_updown(sht_win_b[1], 2);
+	sheet_updown(sht_win_b[2], 3);
+	sheet_updown(sht_win,      4);
+	sheet_updown(sht_mouse,    5);
 	
-	init_mouse_cursor8(mcursor,COL8_008484);	/*描画鼠标指针*/
-	putblock8_8(binfo->vram,binfo->scrnx,16,16,mx,my,mcursor,16);	/*显示鼠标指针*/
+	/*显示鼠标坐标*/
+	sprintf(s, "(%3d, %3d)", mx, my);
+	putfonts8_asc_sht(sht_back, 0, 0, COL8_FFFFFF, COL8_008484, s, 10);
+	/*显示内存信息*/
+	sprintf(s, "memory %dMB   free : %dKB",
+	memtotal / (1024 * 1024), memman_total(memman) / 1024);
+	putfonts8_asc_sht(sht_back, 0, 32, COL8_FFFFFF, COL8_008484, s, 40);
+
 	
-	sprintf(s, "(%d, %d)", mx, my);
-	putfonts8_asc(binfo->vram, binfo->scrnx, 0, 0, COL8_FFFFFF, s);
-	
-				
+
 	for(;;){
-		io_hlt();
-	}
-}
-
-void init_palette(void)	/*初始化调色板*/
-{
-	static unsigned char table_rgb[16*3]={
-		0x00,0x00,0x00,
-		0xff,0x00,0x00,
-		0x00,0xff,0x00,
-		0xff,0xff,0x00,
-		0x00,0x00,0xff,
-		0xff,0x00,0xff,
-		0x00,0xff,0xff,
-		0xff,0xff,0xff,
-		0xc6,0xc6,0xc6,
-		0x84,0x00,0x00,
-		0x00,0x84,0x00,
-		0x84,0x84,0x00,
-		0x00,0x00,0x84,
-		0x84,0x00,0x84,
-		0x00,0x84,0x84,
-		0x84,0x84,0x84
-	};
-	set_palette(0,15,table_rgb);
-	return;
-}
-
-void set_palette(int start,int end,unsigned char *rgb)	/*设置调色板*/
-{
-	int i,eflags;
-	eflags=io_load_eflags();
-	io_cli();
-	io_out8(0x03c8,start);
-	
-	for(i=start;i<=end;i++)
-	{
-		io_out8(0x03c9,rgb[0]/4);
-		io_out8(0x03c9,rgb[1]/4);
-		io_out8(0x03c9,rgb[2]/4);
-		rgb+=3;
-	}
-	
-	io_store_eflags(eflags);
-	return;
-}
-
-void boxfill8(unsigned char *vram,int xsize,unsigned char c,int x0,int y0,int x1,int y1)	/*显示框图，显示背景画面用*/
-{
-	int x,y;
-	for(y=y0;y<=y1;y++){
-		for(x=x0;x<=x1;x++)
-			vram[y*xsize+x]=c;
-	}
-	return;	
-}
-
-void init_screen(char *vram,int x,int y)	/*显示背景画面*/
-{
-	boxfill8(vram, x, COL8_008484,  0,     0,      x -  1, y - 29);
-	boxfill8(vram, x, COL8_C6C6C6,  0,     y - 28, x -  1, y - 28);
-	boxfill8(vram, x, COL8_FFFFFF,  0,     y - 27, x -  1, y - 27);
-	boxfill8(vram, x, COL8_C6C6C6,  0,     y - 26, x -  1, y -  1);
-
-	boxfill8(vram, x, COL8_FFFFFF,  3,     y - 24, 59,     y - 24);
-	boxfill8(vram, x, COL8_FFFFFF,  2,     y - 24,  2,     y -  4);
-	boxfill8(vram, x, COL8_848484,  3,     y -  4, 59,     y -  4);
-	boxfill8(vram, x, COL8_848484, 59,     y - 23, 59,     y -  5);
-	boxfill8(vram, x, COL8_000000,  2,     y -  3, 59,     y -  3);
-	boxfill8(vram, x, COL8_000000, 60,     y - 24, 60,     y -  3);
-
-	boxfill8(vram, x, COL8_848484, x - 47, y - 24, x -  4, y - 24);
-	boxfill8(vram, x, COL8_848484, x - 47, y - 23, x - 47, y -  4);
-	boxfill8(vram, x, COL8_FFFFFF, x - 47, y -  3, x -  4, y -  3);
-	boxfill8(vram, x, COL8_FFFFFF, x -  3, y - 24, x -  3, y -  3);
-	return;	
-}
-
-void putfont8(char *vram,int xsize,int x,int y,char c,char *font)	/*字体为16行8列，输出某个字体font*/
-{
-	int i;
-	char *p,d;	
-	
-	for(i=0;i<16;i++){
-		p=vram+(y+i)*xsize+x;
-		d=font[i];
-		if( (d&0x80)!=0	)	p[0]=c;		
-		if( (d&0x40)!=0 )	p[1]=c;		
-		if( (d&0x20)!=0 )	p[2]=c;		
-		if( (d&0x10)!=0 )	p[3]=c;		
-		if( (d&0x08)!=0 )	p[4]=c;		
-		if( (d&0x04)!=0 )	p[5]=c;	
-		if( (d&0x02)!=0 )	p[6]=c;		
-		if( (d&0x01)!=0 )	p[7]=c;	
-	}
-	return;
-}
-
-void putfonts8_asc(char *vram,int xsize,int x,int y,char c,unsigned char *s)	/*显示字符串*/
-{
-	extern char hankaku[4096];
-	for(;*s!=0x00;s++){
-		putfont8(vram,xsize,x,y,c,hankaku+*s*16);
-		x+=8;
-	}
-	return;
-}
-
-void init_mouse_cursor8(char *mouse,char bc)	/*显示鼠标指针*/
-{
-	static char cursor[16][16]={	/*描画鼠标指针*/
-		"**************..",
-		"*OOOOOOOOOOO*...",
-		"*OOOOOOOOOO*....",
-		"*OOOOOOOOO*.....",
-		"*OOOOOOOO*......",
-		"*OOOOOOO*.......",
-		"*OOOOOOO*.......",
-		"*OOOOOOOO*......",
-		"*OOOO**OOO*.....",
-		"*OOO*..*OOO*....",
-		"*OO*....*OOO*...",
-		"*O*......*OOO*..",
-		"**........*OOO*.",
-		"*..........*OOO*",
-		"............*OO*",
-		".............***"
-	};
-	
-	int x,y;	/*根据所描画的鼠标指针，在对应位置填充相应的颜色，并存入*mouse中*/
-	for(y=0;y<16;y++){
-		for(x=0;x<16;x++){
-			if(cursor[y][x]=='*'){
-				mouse[y*16+x]=COL8_000000;
-			}
-			if(cursor[y][x]=='O'){
-				mouse[y*16+x]=COL8_FFFFFF;
-			}
-			if(cursor[y][x]=='.'){
-				mouse[y*16+x]=bc;
-			}
-		}
-	}
-	return;
-}
-
-void putblock8_8(char *vram,int vxsize,int pxsize,int pysize,int px0,int py0,char *buf,int bxsize)	/*将*buf（实参为*mouse）中描画的鼠标指针显示在屏幕相应位置*/
-{
-	int	x,y;
-	for(y=0;y<pysize;y++){
-		for(x=0;x<pxsize;x++){
-			vram[(py0+y)*vxsize+(px0+x)]=buf[y*bxsize+x];
-		}
-	}
-	return;
-}
+		io_cli();	/*后半部分，取出中断数据前，需要关闭中断*/
 		
+		if( fifo32_status(&fifo) == 0) {	
+			task_sleep(task_a);
+			io_sti();	/*没有数据，开放中断*/
+		}else{
+			/*取出数据后就可以开放中断了*/
+			i=fifo32_get(&fifo);
+			io_sti();	
+			
+			if(256<=i && i<=511){	/*键盘数据*/
+				sprintf(s, "%02X", i-256);	/*减去识别需要所加的256*/
+				putfonts8_asc_sht(sht_back, 0, 16, COL8_FFFFFF, COL8_008484, s, 2);	/*显示对应字符串*/
+				if(i<256+0x54){
+					if(keytable[i-256]!=0 && cursor_x<144){	
+						/*显示1个字符就向前移动1次光标*/
+						s[0]=keytable[i-256];
+						s[1]=0;
+						putfonts8_asc_sht(sht_win, cursor_x, 28, COL8_000000, COL8_FFFFFF, s, 1);
+						cursor_x+=8;
+					}
+				}
+				if(i==256+0x0e && cursor_x>8){
+					/*用空格键把光标消去后，后移一次光标*/
+					putfonts8_asc_sht(sht_win, cursor_x, 28, COL8_000000, COL8_FFFFFF, " ", 1);
+					cursor_x-=8;
+				}
+				/*光标再显示*/
+				boxfill8(sht_win->buf, sht_win->bxsize, cursor_c, cursor_x, 28, cursor_x + 7, 43);
+				sheet_refresh(sht_win, cursor_x, 28, cursor_x + 8, 44);
+					
+			}else if(512<=i && i<=767){	/*鼠标数据*/
+				if(mouse_decode(&mdec,i-512)!=0){	/*数据的3个字节都齐后显示出来*/
+					sprintf(s, "[lcr %4d %4d]", mdec.x,mdec.y);
+					if((mdec.btn&0x01)!=0){
+						s[1]='L';
+					}
+					if((mdec.btn&0x02)!=0){
+						s[3]='R';
+					}
+					if((mdec.btn&0x04)!=0){
+						s[2]='C';
+					}
+					putfonts8_asc_sht(sht_back, 32, 16, COL8_FFFFFF, COL8_008484, s, 15);
+					
+					/*重新计算鼠标位置*/
+					mx+=mdec.x;
+					my+=mdec.y;
+					if(mx<0){
+						mx=0;
+					}
+					if(my<0){
+						my=0;
+					}
+					if(mx>binfo->scrnx-1){
+						mx=binfo->scrnx-1;
+					}
+					if(my>binfo->scrny-1){
+						my=binfo->scrny-1;
+					}
+					sprintf(s,"(%3d,%3d)",mx,my);
+					putfonts8_asc_sht(sht_back, 0, 0, COL8_FFFFFF, COL8_008484, s, 10);
+					sheet_slide(sht_mouse,mx,my);	/*包含sheet_refresh*/
+					if ((mdec.btn & 0x01) != 0) {
+						sheet_slide(sht_win, mx - 80, my - 8);
+					}
+				}
+				
+			}else if(i<=1){	/*光标用定时器*/
+				if(i!=0){
+					timer_init(timer,&fifo,0);
+					cursor_c=COL8_000000;
+				}else{
+					timer_init(timer,&fifo,1); 
+					cursor_c = COL8_FFFFFF;
+				}
+				timer_settime(timer, 50);
+				boxfill8(sht_win->buf, sht_win->bxsize, cursor_c, cursor_x, 28, cursor_x + 7, 43);
+				sheet_refresh(sht_win, cursor_x, 28, cursor_x + 8, 44);
+			}
+		}
+	}
+}
+
+void make_window8(unsigned char *buf,int xsize,int ysize,char *title,char act)
+{
+	static char closebtn[14][16]={	
+		"OOOOOOOOOOOOOOO@",
+		"OQQQQQQQQQQQQQ$@",
+		"OQQQQQQQQQQQQQ$@",
+		"OQQQ@@QQQQ@@QQ$@",
+		"OQQQQ@@QQ@@QQQ$@",
+		"OQQQQQ@@@@QQQQ$@",
+		"OQQQQQQ@@QQQQQ$@",
+		"OQQQQQ@@@@QQQQ$@",
+		"OQQQQ@@QQ@@QQQ$@",
+		"OQQQ@@QQQQ@@QQ$@",
+		"OQQQQQQQQQQQQQ$@",
+		"OQQQQQQQQQQQQQ$@",
+		"O$$$$$$$$$$$$$$@",
+		"@@@@@@@@@@@@@@@@"
+	};
+	
+	/*描绘窗口并显示窗口名*/
+	int x,y;
+	char c,tc,tbc;
+	if (act != 0) {
+		tc = COL8_FFFFFF;
+		tbc = COL8_000084;
+	} else {
+		tc = COL8_C6C6C6;
+		tbc = COL8_848484;
+	}
+	boxfill8(buf, xsize, COL8_C6C6C6, 0,         0,         xsize - 1, 0        );
+	boxfill8(buf, xsize, COL8_FFFFFF, 1,         1,         xsize - 2, 1        );
+	boxfill8(buf, xsize, COL8_C6C6C6, 0,         0,         0,         ysize - 1);
+	boxfill8(buf, xsize, COL8_FFFFFF, 1,         1,         1,         ysize - 2);
+	boxfill8(buf, xsize, COL8_848484, xsize - 2, 1,         xsize - 2, ysize - 2);
+	boxfill8(buf, xsize, COL8_000000, xsize - 1, 0,         xsize - 1, ysize - 1);
+	boxfill8(buf, xsize, COL8_C6C6C6, 2,         2,         xsize - 3, ysize - 3);
+	boxfill8(buf, xsize, tbc,         3,         3,         xsize - 4, 20       );
+	boxfill8(buf, xsize, COL8_848484, 1,         ysize - 2, xsize - 2, ysize - 2);
+	boxfill8(buf, xsize, COL8_000000, 0,         ysize - 1, xsize - 1, ysize - 1);
+	putfonts8_asc(buf, xsize, 24, 4, tc, title);
+	
+	/*描绘关闭按钮*/
+	for(y=0;y<14;y++){
+		for(x=0;x<16;x++){
+			c=closebtn[y][x];
+			if(c=='@'){
+				c=COL8_000000;
+			}else if(c=='$') {
+				c=COL8_848484;
+			}else if(c=='Q') {
+				c=COL8_C6C6C6;
+			}else{
+				c=COL8_FFFFFF;
+			}
+			buf[(5+y)*xsize+(xsize-21+x)]=c;
+		}
+	}
+	return;
+}
+
+void putfonts8_asc_sht(struct SHEET *sht,int x,int y,int c,int b,char *s,int l)	/*显示字符串的函数：先涂上背景色，再在上面写字符，最后完成刷新*/
+{
+	boxfill8(sht->buf,sht->bxsize,b,x,y,x+l*8-1,y+15);
+	putfonts8_asc(sht->buf,sht->bxsize,x,y,c,s);
+	sheet_refresh(sht,x,y,x+l*8,y+16);
+	return;
+}
+
+void make_textbox8(struct SHEET *sht, int x0, int y0, int sx, int sy, int c)
+{
+	int x1 = x0 + sx, y1 = y0 + sy;
+	boxfill8(sht->buf, sht->bxsize, COL8_848484, x0 - 2, y0 - 3, x1 + 1, y0 - 3);
+	boxfill8(sht->buf, sht->bxsize, COL8_848484, x0 - 3, y0 - 3, x0 - 3, y1 + 1);
+	boxfill8(sht->buf, sht->bxsize, COL8_FFFFFF, x0 - 3, y1 + 2, x1 + 1, y1 + 2);
+	boxfill8(sht->buf, sht->bxsize, COL8_FFFFFF, x1 + 2, y0 - 3, x1 + 2, y1 + 2);
+	boxfill8(sht->buf, sht->bxsize, COL8_000000, x0 - 1, y0 - 2, x1 + 0, y0 - 2);
+	boxfill8(sht->buf, sht->bxsize, COL8_000000, x0 - 2, y0 - 2, x0 - 2, y1 + 0);
+	boxfill8(sht->buf, sht->bxsize, COL8_C6C6C6, x0 - 2, y1 + 1, x1 + 0, y1 + 1);
+	boxfill8(sht->buf, sht->bxsize, COL8_C6C6C6, x1 + 1, y0 - 2, x1 + 1, y1 + 1);
+	boxfill8(sht->buf, sht->bxsize, c,           x0 - 1, y0 - 1, x1 + 0, y1 + 0);
+	return;
+}
+
+void task_b_main(struct SHEET *sht_win_b)
+{
+	struct FIFO32 fifo;
+	struct TIMER *timer_1s;
+	int i,fifobuf[128],count=0,count0=0;
+	char s[12];
+
+	fifo32_init(&fifo,128,fifobuf,0);
+	timer_1s=timer_alloc();
+	timer_init(timer_1s,&fifo,100);
+	timer_settime(timer_1s,100);
+
+	for(;;){
+		count++;
+		io_cli();
+
+		if(fifo32_status(&fifo)==0){
+			io_sti();
+		}else{
+			i=fifo32_get(&fifo);
+			io_sti();
+			if (i == 100) {
+				sprintf(s, "%11d", count - count0);
+				putfonts8_asc_sht(sht_win_b, 24, 28, COL8_000000, COL8_C6C6C6, s, 11);
+				count0 = count;
+				timer_settime(timer_1s, 100);
+			}
+		}
+	}
+}
